@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"mime"
@@ -41,6 +42,13 @@ import (
 // Whether to forward messages sent by self via webhook.
 // Defaults to true. Override with env FORWARD_SELF=false.
 var forwardSelfMessages = getEnvBool("FORWARD_SELF", true)
+
+// autoDownloadMediaEnabled reports whether incoming media is downloaded
+// automatically, including images for webhooks. A false value leaves media to
+// on-demand /api/download calls. Read per call so tests can toggle it.
+func autoDownloadMediaEnabled() bool {
+	return getEnvBool("WHATSAPP_AUTO_DOWNLOAD_MEDIA", true)
+}
 
 // CLI flag: request a full history sync at pair time.
 // Only meaningful on a fresh pair (whatsapp.db deleted). See the usage block
@@ -95,10 +103,83 @@ type ChatEphemeralSettings struct {
 	SettingTimestamp int64
 }
 
+func ensureOwnerOnlyDirectory(path string) error {
+	return os.MkdirAll(path, 0o700)
+}
+
+func writeOwnerOnlyFile(path string, data []byte) error {
+	return os.WriteFile(path, data, 0o600)
+}
+
+func validateStorePathComponent(name, value string) error {
+	if value == "" || value == "." || value == ".." || filepath.IsAbs(value) ||
+		filepath.Base(value) != value || strings.ContainsAny(value, `/\\`) {
+		return fmt.Errorf("invalid %s for media store path", name)
+	}
+	return nil
+}
+
+func pathWithin(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
+func mediaDownloadStorePaths(chatJID, mediaType, messageID string, timestamp time.Time) (string, string, string, error) {
+	chatComponent := strings.ReplaceAll(chatJID, ":", "_")
+	if err := validateStorePathComponent("chat JID", chatComponent); err != nil {
+		return "", "", "", err
+	}
+	if err := validateStorePathComponent("message ID", messageID); err != nil {
+		return "", "", "", err
+	}
+	if err := validateStorePathComponent("media type", mediaType); err != nil {
+		return "", "", "", err
+	}
+	// Recheck locality at the filesystem boundary. The checks above enforce the
+	// stricter single-component contract, while IsLocal also rejects paths that
+	// would escape a relative store path after cleaning.
+	if !filepath.IsLocal(chatComponent) {
+		return "", "", "", fmt.Errorf("invalid chat JID for media store path")
+	}
+	if !filepath.IsLocal(messageID) {
+		return "", "", "", fmt.Errorf("invalid message ID for media store path")
+	}
+	if !filepath.IsLocal(mediaType) {
+		return "", "", "", fmt.Errorf("invalid media type for media store path")
+	}
+
+	var ext string
+	switch mediaType {
+	case "image":
+		ext = ".jpg"
+	case "video":
+		ext = ".mp4"
+	case "audio":
+		ext = ".ogg"
+	case "sticker":
+		ext = ".webp"
+	}
+	filename := fmt.Sprintf("%s_%s_%s%s", mediaType, timestamp.Format("20060102_150405"), messageID, ext)
+
+	storeRoot, err := filepath.Abs("store")
+	if err != nil {
+		return "", "", "", fmt.Errorf("resolve media store path: %w", err)
+	}
+	chatDir := filepath.Join(storeRoot, chatComponent)
+	localPath := filepath.Join(chatDir, filename)
+	if !pathWithin(storeRoot, chatDir) || !pathWithin(storeRoot, localPath) {
+		return "", "", "", errors.New("media store path escapes store directory")
+	}
+
+	return chatDir, localPath, filename, nil
+}
+
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
-	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	// Create directory for database if it doesn't exist. Owner-only (0700):
+	// this holds session keys and full message history, so it shouldn't be
+	// group/other readable.
+	if err := ensureOwnerOnlyDirectory("store"); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
@@ -833,7 +914,12 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id, chat_jid) DO UPDATE SET
 			sender = excluded.sender,
-			content = excluded.content,
+			content = CASE
+				WHEN excluded.media_type = 'audio' AND excluded.content = ''
+					AND messages.media_type = 'audio' AND messages.content LIKE '[transcript (%'
+				THEN messages.content
+				ELSE excluded.content
+			END,
 			timestamp = excluded.timestamp,
 			is_from_me = excluded.is_from_me,
 			media_type = excluded.media_type,
@@ -1129,6 +1215,21 @@ func classifyMediaPath(mediaPath string) (whatsmeow.MediaType, string, string) {
 	}
 }
 
+// outboundMediaRow derives the columns sendWhatsAppMessage persists for an
+// outbound message: the media category (via classifyMediaPath, so it can't
+// drift from the upload-side classification), the filename, and the upload
+// metadata downloadMedia needs to redownload it later. Returns zero values
+// for a plain text message (mediaPath == ""). Split out as its own function
+// so it's unit-testable without a live whatsmeow.Client.
+func outboundMediaRow(mediaPath string, upload whatsmeow.UploadResponse) (mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) {
+	if mediaPath == "" {
+		return "", "", "", nil, nil, nil, 0
+	}
+	_, _, mediaType = classifyMediaPath(mediaPath)
+	filename = filepath.Base(mediaPath)
+	return mediaType, filename, upload.URL, upload.MediaKey, upload.FileSHA256, upload.FileEncSHA256, upload.FileLength
+}
+
 func buildDisappearingMode() *waProto.DisappearingMode {
 	return &waProto.DisappearingMode{
 		Initiator: waProto.DisappearingMode_CHANGED_IN_CHAT.Enum(),
@@ -1370,6 +1471,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 
 	msg := &waProto.Message{}
 
+	// Populated below when mediaPath != "", then reused both to build the
+	// outgoing proto and to persist media metadata further down.
+	var upload whatsmeow.UploadResponse
+
 	// Check if we have media to send
 	if mediaPath != "" {
 		// Read media file
@@ -1381,12 +1486,25 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		mediaType, mimeType, _ := classifyMediaPath(mediaPath)
 
 		// Upload media to WhatsApp servers
-		resp, err := client.Upload(context.Background(), mediaData, mediaType)
+		upload, err = client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
 			return false, fmt.Sprintf("Error uploading media: %v", err)
 		}
 
-		fmt.Println("Media uploaded", resp)
+		// Don't log the struct itself — UploadResponse carries the MediaKey
+		// and a signed CDN URL with authentication query parameters.
+		fmt.Printf("Media uploaded (%d bytes)\n", upload.FileLength)
+
+		// downloadMedia reconstructs DirectPath from the stored URL instead
+		// of persisting it directly (no column for it). extractDirectPathFromURL
+		// keeps the URL's query string on purpose (the CDN auth tokens); strip
+		// it from both sides before comparing so this only fires on an actual
+		// mismatch, not the query string that's expected to differ.
+		derivedPath, _, _ := strings.Cut(extractDirectPathFromURL(upload.URL), "?")
+		directPath, _, _ := strings.Cut(upload.DirectPath, "?")
+		if derivedPath != directPath {
+			fmt.Printf("Warning: upload path does not match derived download path; redownload of this attachment may fail\n")
+		}
 
 		// Create the appropriate message type based on media type
 		switch mediaType {
@@ -1394,12 +1512,12 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			msg.ImageMessage = &waProto.ImageMessage{
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
-				URL:           &resp.URL,
-				DirectPath:    &resp.DirectPath,
-				MediaKey:      resp.MediaKey,
-				FileEncSHA256: resp.FileEncSHA256,
-				FileSHA256:    resp.FileSHA256,
-				FileLength:    &resp.FileLength,
+				URL:           &upload.URL,
+				DirectPath:    &upload.DirectPath,
+				MediaKey:      upload.MediaKey,
+				FileEncSHA256: upload.FileEncSHA256,
+				FileSHA256:    upload.FileSHA256,
+				FileLength:    &upload.FileLength,
 			}
 		case whatsmeow.MediaAudio:
 			// Handle ogg audio files
@@ -1421,12 +1539,12 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 
 			msg.AudioMessage = &waProto.AudioMessage{
 				Mimetype:      proto.String(mimeType),
-				URL:           &resp.URL,
-				DirectPath:    &resp.DirectPath,
-				MediaKey:      resp.MediaKey,
-				FileEncSHA256: resp.FileEncSHA256,
-				FileSHA256:    resp.FileSHA256,
-				FileLength:    &resp.FileLength,
+				URL:           &upload.URL,
+				DirectPath:    &upload.DirectPath,
+				MediaKey:      upload.MediaKey,
+				FileEncSHA256: upload.FileEncSHA256,
+				FileSHA256:    upload.FileSHA256,
+				FileLength:    &upload.FileLength,
 				Seconds:       proto.Uint32(seconds),
 				PTT:           proto.Bool(true),
 				Waveform:      waveform,
@@ -1435,26 +1553,35 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			msg.VideoMessage = &waProto.VideoMessage{
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
-				URL:           &resp.URL,
-				DirectPath:    &resp.DirectPath,
-				MediaKey:      resp.MediaKey,
-				FileEncSHA256: resp.FileEncSHA256,
-				FileSHA256:    resp.FileSHA256,
-				FileLength:    &resp.FileLength,
+				URL:           &upload.URL,
+				DirectPath:    &upload.DirectPath,
+				MediaKey:      upload.MediaKey,
+				FileEncSHA256: upload.FileEncSHA256,
+				FileSHA256:    upload.FileSHA256,
+				FileLength:    &upload.FileLength,
 			}
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
-				FileName:      proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				// outboundFileName, not a manual split on "/": the document
+				// filename travels to the recipient, and on Windows the path
+				// is already backslash-normalised, so the naive split leaks
+				// the whole absolute path. See media_path.go.
+				Title:         proto.String(outboundFileName(mediaPath)),
+				FileName:      proto.String(outboundFileName(mediaPath)),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
-				URL:           &resp.URL,
-				DirectPath:    &resp.DirectPath,
-				MediaKey:      resp.MediaKey,
-				FileEncSHA256: resp.FileEncSHA256,
-				FileSHA256:    resp.FileSHA256,
-				FileLength:    &resp.FileLength,
+				URL:           &upload.URL,
+				DirectPath:    &upload.DirectPath,
+				MediaKey:      upload.MediaKey,
+				FileEncSHA256: upload.FileEncSHA256,
+				FileSHA256:    upload.FileSHA256,
+				FileLength:    &upload.FileLength,
 			}
+		default:
+			// Unreachable today (classifyMediaPath only returns the four
+			// types above), but fail loudly rather than send an empty proto
+			// while still persisting media metadata for it.
+			return false, fmt.Sprintf("Unsupported media type for %s", mediaPath)
 		}
 	} else if quotedMsgID != "" || len(mentionedJIDs) > 0 {
 		// Quoted reply and/or mentions: use ExtendedTextMessage so we can
@@ -1525,21 +1652,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			timestamp = time.Now()
 		}
 
-		var mediaType, filename string
-		if mediaPath != "" {
-			filename = filepath.Base(mediaPath)
-			ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(mediaPath), "."))
-			switch ext {
-			case "jpg", "jpeg", "png", "gif", "webp":
-				mediaType = "image"
-			case "ogg":
-				mediaType = "audio"
-			case "mp4", "avi", "mov":
-				mediaType = "video"
-			default:
-				mediaType = "document"
-			}
-		}
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := outboundMediaRow(mediaPath, upload)
 
 		// Pass empty name so StoreChat preserves any existing resolved
 		// contact/group name; we don't have one available here and
@@ -1549,7 +1662,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		}
 		if storeErr := messageStore.StoreMessage(
 			resp.ID, chatJID, senderUser, message, timestamp, true,
-			mediaType, filename, "", nil, nil, nil, 0, quotedMsgID,
+			mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, quotedMsgID,
 		); storeErr != nil {
 			fmt.Printf("Warning: failed to persist outbound message: %v\n", storeErr)
 		}
@@ -1710,11 +1823,15 @@ func resolveLIDChat(client *whatsmeow.Client, chat, senderAlt, recipientAlt type
 		return alt
 	}
 
-	// Fallback: query the whatsmeow LID-PN mapping store.
-	pn, err := client.Store.LIDs.GetPNForLID(context.Background(), chat)
-	if err == nil && !pn.IsEmpty() {
-		fmt.Printf("Resolved LID chat %s -> %s (from LID store)\n", chat, pn.ToNonAD())
-		return pn.ToNonAD()
+	// Fallback: query the whatsmeow LID-PN mapping store. Guarded like
+	// resolveUserJID so a client without a store (tests, early startup)
+	// degrades to the unresolved LID instead of a nil dereference.
+	if client != nil && client.Store != nil && client.Store.LIDs != nil {
+		pn, err := client.Store.LIDs.GetPNForLID(context.Background(), chat)
+		if err == nil && !pn.IsEmpty() {
+			fmt.Printf("Resolved LID chat %s -> %s (from LID store)\n", chat, pn.ToNonAD())
+			return pn.ToNonAD()
+		}
 	}
 
 	fmt.Printf("Warning: could not resolve LID chat %s to phone JID\n", chat)
@@ -1871,6 +1988,10 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 	}
 
+	// Status updates are stored but never forwarded or auto-downloaded.
+	isStatus := msg.Info.Chat == types.StatusBroadcastJID
+	shouldForward := !isStatus && webhooksEnabled() && (forwardSelfMessages || !msg.Info.IsFromMe)
+
 	// Reactions arrive as their own message stanza rather than message content.
 	// Persist them in the messages table as media_type="reaction", with the
 	// emoji in `content` and the reacted-to message ID in `filename`, then
@@ -1891,7 +2012,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			); err != nil {
 				logger.Warnf("Failed to store reaction: %v", err)
 			}
-			if forwardSelfMessages || !msg.Info.IsFromMe {
+			if shouldForward {
 				SendReactionWebhook(sender, chatJID, msg.Info.IsFromMe, msg.Info.ID, reactedToID, emoji)
 			}
 		}
@@ -1933,8 +2054,14 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileLength,
 		quotedMessageId,
 	)
-	if err != nil {
-		logger.Warnf("Failed to store message: %v", err)
+	stored := err == nil
+	if !stored {
+		// The row is what /api/download, get_message_context and mark-read key
+		// on; without it the message exists only downstream. Still forward the
+		// webhook so the text isn't lost, but say so loudly and skip media
+		// downloads, which look the row up by ID and would only fail again.
+		logger.Errorf("Failed to store message %s in %s (webhook still sent, media not downloaded): %v",
+			msg.Info.ID, chatJID, err)
 	}
 
 	var quotedIsFromMe *bool
@@ -1946,17 +2073,14 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 	}
 
-	// Avoid webhook-only image work when no webhook will receive the message. Media
-	// still downloads asynchronously in that case so it remains available to MCP
-	// tools, but message handling never blocks on a disabled outbound webhook.
-	shouldForward := webhooksEnabled() && (forwardSelfMessages || !msg.Info.IsFromMe)
+	// The opt-out covers every implicit download, including webhook images.
+	shouldDownload := !isStatus && autoDownloadMediaEnabled()
 
-	// For image messages that will be forwarded, download media synchronously so we
-	// can include the base64 payload in the webhook. Other media types (and images
-	// when webhook forwarding is disabled) download asynchronously for caching.
+	// Forwarded images download synchronously to include bytes in the webhook.
+	// Other media downloads asynchronously for caching when downloads are enabled.
 	var imageDownloadPath string
-	var imageMimeType string
-	if mediaType == "image" && url != "" && len(mediaKey) > 0 && shouldForward {
+	imageMimeType := msg.Message.GetImageMessage().GetMimetype()
+	if mediaType == "image" && url != "" && len(mediaKey) > 0 && shouldForward && stored && shouldDownload {
 		logger.Infof("Downloading image media for message %s (synchronous)", msg.Info.ID)
 		success, _, _, dlPath, dlErr := downloadMediaForMessage(client, messageStore, msg.Info.ID, chatJID)
 		if success && dlErr == nil {
@@ -1977,21 +2101,21 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		} else {
 			logger.Warnf("❌ Image download failed: %v", dlErr)
 			// Fall back to async download so media is cached for future MCP tool calls
-			go func() {
+			scheduleMediaDownload(func() {
 				_, _, _, _, _ = downloadMediaForMessage(client, messageStore, msg.Info.ID, chatJID)
-			}()
+			})
 		}
-	} else if mediaType != "" && url != "" && len(mediaKey) > 0 {
+	} else if mediaType != "" && url != "" && len(mediaKey) > 0 && stored && shouldDownload {
 		// Media that is not included in a webhook payload: async download for caching.
 		logger.Infof("Auto-downloading %s media for message %s", mediaType, msg.Info.ID)
-		go func() {
+		scheduleMediaDownload(func() {
 			success, _, _, downloadPath, err := downloadMediaForMessage(client, messageStore, msg.Info.ID, chatJID)
 			if success && err == nil {
 				logger.Infof("✅ Auto-downloaded media: %s", downloadPath)
 			} else {
 				logger.Warnf("❌ Auto-download failed: %v", err)
 			}
-		}()
+		})
 	}
 
 	// Send webhook for incoming messages.
@@ -2009,7 +2133,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 				msg.Info.ID, mediaType, imageMimeType, filename, imageDownloadPath,
 			)
 		} else {
-			SendWebhook(sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent, quotedIsFromMe, mentionedJIDs)
+			SendWebhookWithMessageID(sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent, quotedIsFromMe, mentionedJIDs, msg.Info.ID)
 		}
 	}
 
@@ -2113,6 +2237,14 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 	return d.MediaType
 }
 
+// hasCompleteMediaInfo reports whether a stored message row carries enough
+// media metadata to be downloadable. Extracted so tests can exercise the
+// exact predicate downloadMedia enforces, instead of a hand-copied duplicate
+// that can silently drift from it.
+func hasCompleteMediaInfo(url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) bool {
+	return url != "" && len(mediaKey) != 0 && len(fileSHA256) != 0 && len(fileEncSHA256) != 0 && fileLength != 0
+}
+
 // Function to download media from a message
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
 	// Query the database for the message including timestamp
@@ -2137,41 +2269,21 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("not a media message")
 	}
 
-	// Rebuild filename from (timestamp, messageID) — must match extractMediaInfo.
-	// The message ID disambiguates two messages that arrive in the same second.
-	var ext string
-	switch mediaType {
-	case "image":
-		ext = ".jpg"
-	case "video":
-		ext = ".mp4"
-	case "audio":
-		ext = ".ogg"
-	case "sticker":
-		ext = ".webp"
-	case "document":
-		ext = ""
-	default:
-		ext = ""
+	// Rebuild the path from (timestamp, messageID) — it must match
+	// extractMediaInfo and remain inside store/ even for malformed IDs.
+	chatDir, localPath, filename, err := mediaDownloadStorePaths(chatJID, mediaType, messageID, timestamp)
+	if err != nil {
+		return false, "", "", "", err
 	}
-	filename := fmt.Sprintf("%s_%s_%s%s", mediaType, timestamp.Format("20060102_150405"), messageID, ext)
 
-	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
-
-	// Create directory for the chat if it doesn't exist
-	if err := os.MkdirAll(chatDir, 0755); err != nil {
+	// Create directory for the chat if it doesn't exist. Owner-only (0700):
+	// downloaded media can include private images/documents/voice notes.
+	if err := ensureOwnerOnlyDirectory(chatDir); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
-	localPath := fmt.Sprintf("%s/%s", chatDir, filename)
-
-	// Get absolute path
-	absPath, err := filepath.Abs(localPath)
-	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
-	}
+	// mediaDownloadStorePaths returns an absolute, store-confined path.
+	absPath := localPath
 
 	// Check if file already exists
 	if _, err := os.Stat(localPath); err == nil {
@@ -2181,7 +2293,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// If we don't have all the media info we need, we can't download
-	if url == "" || len(mediaKey) == 0 || len(fileSHA256) == 0 || len(fileEncSHA256) == 0 || fileLength == 0 {
+	if !hasCompleteMediaInfo(url, mediaKey, fileSHA256, fileEncSHA256, fileLength) {
 		return false, "", "", "", fmt.Errorf("incomplete media information for download")
 	}
 
@@ -2220,13 +2332,14 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(context.Background(), downloader)
+	mediaData, err := downloadMediaData(client, downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
 
-	// Save the downloaded media to file
-	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
+	// Save the downloaded media to file. Owner-only (0600), same reasoning
+	// as the chat directory above.
+	if err := writeOwnerOnlyFile(localPath, mediaData); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
 
@@ -2234,9 +2347,18 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	return true, mediaType, filename, absPath, nil
 }
 
+// downloadMediaData lets media persistence tests avoid a network request.
+var downloadMediaData = func(client *whatsmeow.Client, downloader *MediaDownloader) ([]byte, error) {
+	return client.Download(context.Background(), downloader)
+}
+
 // downloadMediaForMessage allows message-handling tests to verify whether a
 // download blocks event processing without changing production behavior.
 var downloadMediaForMessage = downloadMedia
+
+// scheduleMediaDownload launches background caching work. Keeping the launch
+// separate lets tests verify whether work was scheduled without timing sleeps.
+var scheduleMediaDownload = func(download func()) { go download() }
 
 // Extract direct path from a WhatsApp media URL
 func extractDirectPathFromURL(url string) string {
@@ -2697,6 +2819,52 @@ func webhookStartupMessage(forwardSelf bool) string {
 	return "FORWARD_SELF disabled: self messages will NOT be forwarded"
 }
 
+// pairingQROutcome reports how a pairing QR channel ended.
+type pairingQROutcome int
+
+const (
+	// pairingQRChannelClosed means the channel drained without a verdict.
+	pairingQRChannelClosed pairingQROutcome = iota
+	// pairingQRSucceeded means the phone completed the handshake.
+	pairingQRSucceeded
+	// pairingQRTimedOut means the server ran out of codes to offer.
+	pairingQRTimedOut
+)
+
+// renderPairingQRCodes drains a pairing QR channel and writes every code the
+// server offers to w, delegating the actual rendering to renderQR.
+//
+// Every code has to be rendered, not just the first one. Since WhatsApp's 2026
+// companion-registration change the server answers a scan with a
+// companion_reg_refresh notification; whatsmeow then rotates the ADV secret
+// and emits a fresh code, and only that rotated code can still complete the
+// handshake. Showing just the first code leaves a stale one on screen, so
+// every later scan is validated against a secret the server has already
+// dropped and the phone reports "check your connection" while pairing never
+// completes.
+func renderPairingQRCodes(qrChan <-chan whatsmeow.QRChannelItem, w io.Writer, renderQR func(code string, w io.Writer)) pairingQROutcome {
+	codes := 0
+	for evt := range qrChan {
+		switch evt.Event {
+		case "code":
+			codes++
+			// Terminal output is best-effort; keep draining pairing events if a write fails.
+			if codes == 1 {
+				_, _ = fmt.Fprintln(w, "\nScan this QR code with your WhatsApp app:")
+			} else {
+				_, _ = fmt.Fprintf(w, "\nQR code refreshed (#%d) - scan this one instead:\n", codes)
+			}
+			renderQR(evt.Code, w)
+			_, _ = fmt.Fprintln(w, "\nWaiting for QR code scan...")
+		case "success":
+			return pairingQRSucceeded
+		case "timeout":
+			return pairingQRTimedOut
+		}
+	}
+	return pairingQRChannelClosed
+}
+
 func main() {
 	flag.Parse()
 
@@ -2709,8 +2877,9 @@ func main() {
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
-	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	// Create directory for database if it doesn't exist. Owner-only (0700),
+	// same reasoning as NewMessageStore.
+	if err := ensureOwnerOnlyDirectory("store"); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
@@ -3016,23 +3185,15 @@ func main() {
 				continue
 			}
 
-			// Print QR code for pairing with phone
-			qrCodeShown := false
-			for evt := range qrChan {
-				if evt.Event == "code" {
-					if !qrCodeShown {
-						fmt.Println("\nScan this QR code with your WhatsApp app:")
-						qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-						fmt.Println("\nWaiting for QR code scan...")
-						qrCodeShown = true
-					}
-				} else if evt.Event == "success" {
-					connected <- true
-					break
-				} else if evt.Event == "timeout" {
-					logger.Warnf("QR code timed out")
-					break
-				}
+			// Print QR codes for pairing with the phone.
+			switch renderPairingQRCodes(qrChan, os.Stdout, func(code string, w io.Writer) {
+				qrterminal.GenerateHalfBlock(code, qrterminal.L, w)
+			}) {
+			case pairingQRSucceeded:
+				connected <- true
+			case pairingQRTimedOut:
+				logger.Warnf("QR code timed out")
+			case pairingQRChannelClosed:
 			}
 
 			// Wait for connection with timeout
