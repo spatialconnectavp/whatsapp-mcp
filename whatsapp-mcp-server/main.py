@@ -2,6 +2,7 @@ import os
 import signal
 import sys
 import tempfile
+from functools import partial
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP, Image
@@ -589,18 +590,19 @@ def transcribe_audio(message_id: str, chat_jid: str, force: bool = False) -> dic
     }
 
 
-def shutdown_handler(signum, frame):
-    """Handle shutdown signals gracefully to prevent zombie processes."""
+def shutdown_handler(signum, frame, *, transport="stdio"):
+    """Stop a terminated stdio client without finalizing locked pipe readers."""
+    if transport == "stdio":
+        # sys.exit can hang in AnyIO or abort in Python's buffered-I/O finalizers
+        # while a reader holds stdin's lock. Like the parent watchdog, OS-signal
+        # shutdown must exit directly. Ordinary EOF still drains pending work.
+        os._exit(0)
     sys.exit(0)
 
 
 if __name__ == "__main__":
     # Capture before any await — os.getppid() is dynamic.
     parent_pid = os.getppid()
-    # Register signal handlers for clean shutdown
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
-
     # Resolve the transport first: host/port are only used (and validated) for the
     # network transports, so a bad WHATSAPP_MCP_PORT can't break a stdio launch.
     # The localhost default keeps a remote server unreachable until explicitly opened up.
@@ -616,6 +618,10 @@ if __name__ == "__main__":
             )
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
+
+    signal_handler = partial(shutdown_handler, transport=transport)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     if transport == "stdio":
         install_stdio_parent_watchdog("WHATSAPP_PARENT_WATCHDOG_S", parent_pid=parent_pid)

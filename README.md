@@ -494,6 +494,11 @@ WHATSAPP_MCP_TRANSPORT=http WHATSAPP_MCP_PORT=8000 uv run main.py
 WHATSAPP_MCP_TRANSPORT=sse uv run main.py
 ```
 
+For stdio, `SIGTERM` and `SIGINT` stop the process immediately, cancelling any
+in-flight calls. This avoids shutdown hangs and Python crash reports caused by
+background pipe readers. Ordinary stdin EOF still allows pending work to finish;
+HTTP/SSE retain normal Python shutdown cleanup.
+
 `http` is an alias for the spec's `streamable-http` transport and is the
 recommended choice for remote connections; `sse` is kept for older clients.
 
